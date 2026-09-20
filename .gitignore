@@ -1,0 +1,16 @@
+# 环境变量与密钥（勿提交 Git）
+.env.local
+
+# 本地模型权重（后续下载，体积大不入库）
+models/
+
+# Python 字节码 / 缓存 / 虚拟环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / 操作系统
+.idea/
+.vscode/
+.DS_Store
