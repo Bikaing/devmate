@@ -8,6 +8,9 @@ import {
 import { useChatStore } from "@/stores/chat";
 import type { ReviewFinding, ReviewMode, ReviewTask, ReviewTaskDetail } from "@/api/types";
 
+// name 供 BasicLayout 的 keep-alive include 匹配，实现路由切换后状态保留
+defineOptions({ name: "ReviewPage" });
+
 const chat = useChatStore();
 
 // ── 发起表单 ──

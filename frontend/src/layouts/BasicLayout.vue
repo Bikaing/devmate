@@ -10,7 +10,11 @@ const router = useRouter();
 const auth = useAuthStore();
 const chat = useChatStore();
 
-const activeMenu = computed(() => (route.path.startsWith("/chat") ? "/chat" : "/"));
+const activeMenu = computed(() => {
+  if (route.path.startsWith("/chat")) return "/chat";
+  if (route.path.startsWith("/review")) return "/review";
+  return "/";
+});
 
 onMounted(() => {
   chat.loadConversations().catch(() => {});
@@ -43,6 +47,10 @@ function logout() {
           <el-icon><ChatDotRound /></el-icon>
           <span>代码问答</span>
         </el-menu-item>
+        <el-menu-item index="/review">
+          <el-icon><View /></el-icon>
+          <span>代码审查</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="conv-section">
@@ -68,7 +76,12 @@ function logout() {
 
     <el-container class="main-area">
       <el-main class="app-main">
-        <router-view />
+        <router-view v-slot="{ Component }">
+          <!-- 只缓存审查页：切走再切回保留表单/进度/结果；其余页面行为不变 -->
+          <keep-alive include="ReviewPage">
+            <component :is="Component" />
+          </keep-alive>
+        </router-view>
       </el-main>
     </el-container>
   </el-container>
