@@ -54,8 +54,8 @@ class Settings(BaseSettings):
     shell_docker_mcp_url: str = "http://localhost:8000/mcp/shell-docker"
     sast_mcp_url: str = "http://localhost:8000/mcp/sast"
 
-    # ── Web 搜索（Tavily 可选；留空则自动用免费的 DuckDuckGo）──
-    tavily_api_key: str = ""
+    # ── Web 搜索（博查：国内可达的带 key 搜索 API；留空则联网搜索工具报配置缺失并降级）──
+    bocha_api_key: str = ""
 
     # ── 应用基础配置 ──
     app_env: str = "local"       # 运行环境标识

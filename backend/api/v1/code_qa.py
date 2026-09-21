@@ -21,6 +21,7 @@ class ChatRequest(BaseModel):
     repo_id: UUID = Field(..., description="目标仓库 ID（须属于当前用户且已索引）")
     query: str = Field(..., min_length=1, max_length=2000, description="用户问题")
     conversation_id: UUID | None = Field(None, description="会话 ID，空则新建")
+    web_search: bool = Field(False, description="联网开关：ON 时并行 web 搜索补充通用/时效信息")
 
 
 def _map_biz_error(e: CodePilotBaseError) -> HTTPException:
@@ -47,6 +48,7 @@ async def chat(
             repo_id=str(req.repo_id),
             conversation_id=str(req.conversation_id) if req.conversation_id else None,
             query=req.query,
+            web_search=req.web_search,
         )
     except CodePilotBaseError as e:
         raise _map_biz_error(e) from e
@@ -94,9 +96,10 @@ async def list_messages(
     if owned is None:
         raise HTTPException(status_code=404, detail="会话不存在或无权访问")
     rows = (await db.execute(text(
-        "SELECT id, role, msg_type, content, citations, created_at "
+        "SELECT id, role, msg_type, content, citations, web_sources, created_at "
         "FROM messages WHERE conversation_id = :cid ORDER BY created_at"),
         {"cid": conversation_id})).all()
     return [{"id": str(r.id), "role": r.role, "msg_type": r.msg_type,
              "content": r.content, "citations": r.citations,
+             "web_sources": r.web_sources,
              "created_at": r.created_at.isoformat()} for r in rows]

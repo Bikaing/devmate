@@ -17,6 +17,7 @@ const chat = useChatStore();
 const messages = ref<UiMessage[]>([]);
 const input = ref("");
 const sending = ref(false);
+const webSearch = ref(false); // 联网开关：用户主动选择是否并行 web 搜索
 const conversationId = ref<string | null>(null);
 const scroller = ref<HTMLElement | null>(null);
 const showRepoManager = ref(false);
@@ -43,6 +44,7 @@ async function loadHistory(id: string) {
     msgType: m.msg_type === "error" ? "error" : "text",
     content: m.content,
     citations: m.citations || undefined,
+    webSources: m.web_sources || undefined,
   }));
   scrollToBottom();
 }
@@ -101,7 +103,12 @@ async function send() {
   scrollToBottom();
 
   await streamChat(
-    { repo_id: activeRepoId.value, query, conversation_id: conversationId.value },
+    {
+      repo_id: activeRepoId.value,
+      query,
+      conversation_id: conversationId.value,
+      web_search: webSearch.value,
+    },
     {
       onMeta: (d) => {
         // 首轮：拿到新会话 id，替换 URL（不触发历史重载）并刷新侧边栏
@@ -122,6 +129,7 @@ async function send() {
         assistant.streaming = false;
         assistant.id = d.message_id;
         assistant.citations = d.citations || [];
+        assistant.webSources = d.web_sources || undefined;
         scrollToBottom();
       },
       onError: (d) => {
@@ -201,7 +209,7 @@ async function send() {
         title="当前仓库索引未就绪，无法问答，请切换到已索引（indexed）的仓库"
         style="margin-bottom: 10px"
       />
-      <div class="input-row">
+      <div class="composer-card">
         <el-input
           v-model="input"
           type="textarea"
@@ -209,17 +217,32 @@ async function send() {
           resize="none"
           placeholder="向仓库提问…（Enter 发送，Shift+Enter 换行）"
           :disabled="sending"
+          class="card-input"
           @keydown="onKeydown"
         />
-        <el-button
-          type="primary"
-          :loading="sending"
-          :disabled="!canSend"
-          class="send-btn"
-          @click="send"
-        >
-          发送
-        </el-button>
+        <div class="card-tools">
+          <button
+            type="button"
+            class="pill"
+            :class="{ active: webSearch }"
+            :disabled="sending"
+            title="打开后回答将并行参考网页搜索结果（通用/时效性问题）"
+            @click="webSearch = !webSearch"
+          >
+            <el-icon><ChromeFilled /></el-icon>
+            <span>联网搜索</span>
+          </button>
+          <span class="spacer" />
+          <el-button
+            type="primary"
+            :loading="sending"
+            :disabled="!canSend"
+            class="send-btn"
+            @click="send"
+          >
+            发送
+          </el-button>
+        </div>
       </div>
     </div>
 
@@ -263,18 +286,64 @@ async function send() {
   background: #fff;
   padding: 14px 32px 18px;
 }
-.input-row {
+.composer-card {
   max-width: 900px;
   margin: 0 auto;
-  display: flex;
-  gap: 12px;
-  align-items: flex-end;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
+  padding: 10px 14px 12px;
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.06);
+  transition: border-color 0.18s ease;
 }
-.input-row :deep(.el-textarea) {
+.composer-card:focus-within {
+  border-color: #c7d7fe;
+}
+.card-input :deep(.el-textarea__inner) {
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  padding: 4px 6px;
+}
+.card-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  color: #374151;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+.pill:hover {
+  border-color: #c7d7fe;
+  color: #1d4ed8;
+}
+.pill.active {
+  background: #e0e7ff;
+  border-color: #c7d7fe;
+  color: #1d4ed8;
+}
+.pill:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.spacer {
   flex: 1;
 }
 .send-btn {
-  height: 54px;
+  height: 38px;
   width: 88px;
+  border-radius: 10px;
 }
 </style>

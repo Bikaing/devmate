@@ -12,9 +12,14 @@ class CodeQAState(TypedDict, total=False):
     repo_id: str
     query: str                                    # 本轮问题，retrieve 节点直接消费
     messages: Annotated[list[Any], add_messages]  # 多轮消息流，generate 节点追加 AIMessage
+    web_search_enabled: bool                      # 联网开关：用户主动选择是否并行 web 搜索
+
+    # ── route 节点产物 ──
+    intent: str            # 'repo'=需仓库上下文走 RAG；'general'=通用问题跳过仓库检索
 
     # ── retrieve 节点产物 ──
     contexts: list[dict]   # RetrievedContext 的 asdict 形态：path/language/content/token_count/citations
+    web_sources: list[dict]  # [{title, href, body}]；开关 OFF 或搜索失败时为空列表
 
     # ── generate 节点产物 ──
     answer: str

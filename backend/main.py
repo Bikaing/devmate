@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api.v1 import auth, code_qa, code_review, repos
+from backend.api.v1 import auth, code_qa, code_review, doc_insight, repos
 from backend.agents.code_qa.graph import build_code_qa_graph
 from backend.agents.code_review.graph import build_code_review_graph
+from backend.agents.doc_insight.graph import build_doc_insight_graph
 from backend.config import get_settings
 from backend.core.logger import configure_logging, get_logger
 from backend.core.memory import get_checkpointer
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
     async with get_checkpointer() as ckpt:    # PG 检查点器，进程级复用
         app.state.code_qa_graph = build_code_qa_graph(checkpointer=ckpt)
         app.state.code_review_graph = build_code_review_graph(checkpointer=ckpt)
+        app.state.doc_insight_graph = build_doc_insight_graph(checkpointer=ckpt)
         logger.info("app.graphs_ready")
         yield
 
@@ -43,6 +45,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/v1/auth")
 app.include_router(code_qa.router, prefix="/api/v1")
 app.include_router(code_review.router, prefix="/api/v1")
+app.include_router(doc_insight.router, prefix="/api/v1")
 app.include_router(repos.router, prefix="/api/v1")
 
 

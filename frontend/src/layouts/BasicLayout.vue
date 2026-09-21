@@ -13,6 +13,7 @@ const chat = useChatStore();
 const activeMenu = computed(() => {
   if (route.path.startsWith("/chat")) return "/chat";
   if (route.path.startsWith("/review")) return "/review";
+  if (route.path.startsWith("/doc-insight")) return "/doc-insight";
   return "/";
 });
 
@@ -51,6 +52,10 @@ function logout() {
           <el-icon><View /></el-icon>
           <span>代码审查</span>
         </el-menu-item>
+        <el-menu-item index="/doc-insight">
+          <el-icon><Document /></el-icon>
+          <span>文档洞察</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="conv-section">
@@ -77,8 +82,8 @@ function logout() {
     <el-container class="main-area">
       <el-main class="app-main">
         <router-view v-slot="{ Component }">
-          <!-- 只缓存审查页：切走再切回保留表单/进度/结果；其余页面行为不变 -->
-          <keep-alive include="ReviewPage">
+          <!-- 只缓存审查页与洞察页：切走再切回保留表单/进度/结果；其余页面行为不变 -->
+          <keep-alive :include="['ReviewPage', 'DocInsightPage']">
             <component :is="Component" />
           </keep-alive>
         </router-view>

@@ -40,6 +40,21 @@ const pending = computed(() => props.message.streaming && !props.message.content
         v-if="!isUser && message.citations && message.citations.length"
         :citations="message.citations"
       />
+
+      <div
+        v-if="!isUser && message.webSources && message.webSources.length"
+        class="web-sources"
+      >
+        <div class="ws-title">网页参考</div>
+        <a
+          v-for="(w, i) in message.webSources"
+          :key="i"
+          :href="w.href"
+          target="_blank"
+          rel="noopener"
+          class="ws-item"
+        >{{ i + 1 }}. {{ w.title || w.href }}</a>
+      </div>
     </div>
   </div>
 </template>
@@ -102,6 +117,27 @@ const pending = computed(() => props.message.streaming && !props.message.content
   display: flex;
   gap: 4px;
   padding: 4px 0;
+}
+.web-sources {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed #e5e7eb;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ws-title {
+  font-size: 12px;
+  color: #6b7280;
+}
+.ws-item {
+  font-size: 12px;
+  color: #1d4ed8;
+  text-decoration: none;
+  word-break: break-all;
+}
+.ws-item:hover {
+  text-decoration: underline;
 }
 .thinking .dot {
   width: 7px;

@@ -22,6 +22,11 @@ const router = createRouter({
           component: () => import("@/views/Chat.vue"),
         },
         { path: "review", name: "review", component: () => import("@/views/Review.vue") },
+        {
+          path: "doc-insight",
+          name: "doc-insight",
+          component: () => import("@/views/DocInsight.vue"),
+        },
       ],
     },
     { path: "/:pathMatch(.*)*", redirect: "/" },

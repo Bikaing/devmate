@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from backend.agents.code_qa import schema as code_qa_schema
 from backend.agents.code_review import schema as code_review_schema
+from backend.agents.doc_insight import schema as doc_insight_schema
 from backend.core.logger import get_logger
 from backend.dependencies import AsyncSessionLocal
 
@@ -14,6 +15,9 @@ logger = get_logger(__name__)
 # 底座表（init_db.sql）之后的通用补丁，按时间顺序追加。SQL 必须幂等
 _CORE_MIGRATIONS: list[tuple[str, str]] = [
     # 格式：("表名.列名 或 索引名", "ALTER TABLE xxx ADD COLUMN IF NOT EXISTS yyy JSONB"),
+    # 联网开关链路：assistant 消息的网页参考来源（[{title,href,body}]），与 citations 契约分离
+    ("messages.web_sources",
+     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS web_sources JSONB"),
 ]
 
 # 各 Agent 模块的 schema 常量模块；新增 Agent 时在此追加，列表顺序即执行顺序。
@@ -21,6 +25,7 @@ _CORE_MIGRATIONS: list[tuple[str, str]] = [
 _AGENT_SCHEMA_MODULES = [
     code_qa_schema,
     code_review_schema,
+    doc_insight_schema,
 ]
 
 # 合并后的完整补丁列表：先通用补丁，后各 Agent 表

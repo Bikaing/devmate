@@ -34,6 +34,7 @@ _AGENT_MODEL_ROUTING: dict[str, str] = {
     "doc_insight": "deepseek-chat",      # 文档洞察：长文提炼与报告生成
     "incident_triage": "deepseek-chat",  # 故障排查：日志推理与假设验证
     "summarize": "deepseek-chat",        # 对话摘要压缩（预留）
+    "route": "deepseek-chat",            # 意图路由：二分类短输出，用快模型省延迟
 }
 
 

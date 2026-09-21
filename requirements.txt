@@ -47,7 +47,6 @@ python-dotenv==1.0.1                   # 加载 .env.local
 
 # ===== MCP 协议 =====
 mcp==1.26.0                            # 官方 MCP Python SDK（含 FastMCP）
-duckduckgo-search==8.1.1               # 免费 Web 搜索，无需 API key
 
 # ===== 测试 =====
 pytest==8.3.4

@@ -1,37 +1,33 @@
+// doc_insight 接口层：SSE 流式洞察 + 任务列表/详情。
+// SSE 与 codeReview.ts 同套路：fetch + ReadableStream 手动切分（EventSource 不支持 POST）。
+import http from "./http";
 import { useAuthStore } from "@/stores/auth";
-import type { Citation, WebSource } from "./types";
+import type { DocTask, DocTaskDetail } from "./types";
 
-export interface ChatPayload {
-  repo_id: string;
-  query: string;
-  conversation_id?: string | null;
-  web_search?: boolean;
+export interface DocInsightPayload {
+  title: string;
+  content: string;
 }
 
-export interface SseHandlers {
-  onMeta?: (d: { conversation_id: string; run_id: string }) => void;
+export interface DocInsightSseHandlers {
+  onMeta?: (d: { task_id: string; title: string }) => void;
+  onProgress?: (d: Record<string, unknown>) => void;
   onToken?: (d: { text: string }) => void;
-  onDone?: (d: {
-    message_id: string;
-    citations: Citation[];
-    web_sources: WebSource[];
-    duration_ms: number;
-  }) => void;
+  onDone?: (d: { task_id: string; report: string; duration_ms: number }) => void;
   onError?: (d: { message: string }) => void;
-  // 流开始前的 HTTP 错误（400 输入非法 / 409 索引未就绪 / 401 未鉴权）
+  // 流开始前的 HTTP 错误（400 参数非法 / 401 未鉴权）
   onHttpError?: (status: number, detail: string) => void;
 }
 
-// SSE 用 fetch + ReadableStream 手动解析：EventSource 不支持 POST，无法带 body。
-export async function streamChat(
-  payload: ChatPayload,
-  handlers: SseHandlers,
+export async function streamDocInsight(
+  payload: DocInsightPayload,
+  handlers: DocInsightSseHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
   const auth = useAuthStore();
   let resp: Response;
   try {
-    resp = await fetch("/api/v1/code-qa/chat", {
+    resp = await fetch("/api/v1/doc-insight/tasks", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -74,7 +70,7 @@ export async function streamChat(
   }
 }
 
-function dispatch(raw: string, handlers: SseHandlers): void {
+function dispatch(raw: string, handlers: DocInsightSseHandlers): void {
   let event = "message";
   const dataLines: string[] = [];
   for (const line of raw.split("\n")) {
@@ -92,6 +88,9 @@ function dispatch(raw: string, handlers: SseHandlers): void {
     case "meta":
       handlers.onMeta?.(data as never);
       break;
+    case "progress":
+      handlers.onProgress?.(data as never);
+      break;
     case "token":
       handlers.onToken?.(data as never);
       break;
@@ -102,4 +101,14 @@ function dispatch(raw: string, handlers: SseHandlers): void {
       handlers.onError?.(data as never);
       break;
   }
+}
+
+export async function listDocTasks(): Promise<DocTask[]> {
+  const { data } = await http.get<DocTask[]>("/doc-insight/tasks");
+  return data;
+}
+
+export async function getDocTask(taskId: string): Promise<DocTaskDetail> {
+  const { data } = await http.get<DocTaskDetail>(`/doc-insight/tasks/${taskId}`);
+  return data;
 }

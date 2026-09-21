@@ -33,10 +33,12 @@ class QARunContext:
     thread_id: str
     run_id: str
     repo_id: str
+    web_search: bool = False   # 联网开关：用户主动选择，随请求透传进图状态
 
 
 async def prepare_code_qa(user_id: str, repo_id: str,
-                          conversation_id: str | None, query: str) -> QARunContext:
+                          conversation_id: str | None, query: str,
+                          web_search: bool = False) -> QARunContext:
     """流开始前的全部校验与落库：仓库权限/索引状态、会话获取或创建、
     用户消息、agent_run 记录。失败抛业务异常（endpoint 映射 HTTP 码），
     此时 SSE 尚未开始，可以正常返回错误响应。"""
@@ -87,7 +89,7 @@ async def prepare_code_qa(user_id: str, repo_id: str,
             "UPDATE conversations SET last_active_at = NOW() WHERE id = :cid"),
             {"cid": uuid.UUID(conversation_id)})
         await session.commit()
-    return QARunContext(conversation_id, thread_id, run_id, repo_id)
+    return QARunContext(conversation_id, thread_id, run_id, repo_id, web_search)
 
 
 async def stream_code_qa(graph, ctx: QARunContext, query: str):
@@ -97,7 +99,8 @@ async def stream_code_qa(graph, ctx: QARunContext, query: str):
            "data": {"conversation_id": ctx.conversation_id, "run_id": ctx.run_id}}
     cfg = make_config(ctx.thread_id)
     graph_input = {"repo_id": ctx.repo_id, "query": query,
-                   "messages": [("human", query)]}
+                   "messages": [("human", query)],
+                   "web_search_enabled": ctx.web_search}
     started = time.perf_counter()
     parts: list[str] = []
     failure: Exception | None = None
@@ -129,12 +132,16 @@ async def stream_code_qa(graph, ctx: QARunContext, query: str):
             citations = [{"file": c["path"], "start_line": c["start_line"],
                           "end_line": c["end_line"], "symbol": c.get("symbol")}
                          for c in state.get("citations") or []]
+            # web_sources 独立列存（不混入 citations 契约）；开关 OFF/搜索失败为空
+            web_sources = state.get("web_sources") or []
             message_id = str((await session.execute(text(
                 "INSERT INTO messages (conversation_id, agent_run_id, role, msg_type, "
-                "content, citations) VALUES (:cid, :run, 'assistant', 'text', :ans, :cites) "
+                "content, citations, web_sources) "
+                "VALUES (:cid, :run, 'assistant', 'text', :ans, :cites, :web) "
                 "RETURNING id"),
                 {"cid": uuid.UUID(ctx.conversation_id), "run": uuid.UUID(ctx.run_id),
-                 "ans": answer, "cites": json.dumps(citations, ensure_ascii=False)}
+                 "ans": answer, "cites": json.dumps(citations, ensure_ascii=False),
+                 "web": json.dumps(web_sources, ensure_ascii=False) if web_sources else None}
             )).scalar_one())
             await session.execute(text(
                 "UPDATE agent_runs SET status = 'success', duration_ms = :dur, "
@@ -143,6 +150,7 @@ async def stream_code_qa(graph, ctx: QARunContext, query: str):
             await session.commit()
             yield {"event": "done",
                    "data": {"message_id": message_id, "citations": citations,
+                            "web_sources": web_sources,
                             "duration_ms": duration_ms}}
         else:
             # ── 失败收尾：Agent 级降级话术落库为 error 卡片 ──
@@ -347,3 +355,104 @@ async def reject_finding(user_id: str, finding_id: str) -> dict:
                 "finding 状态已被并发变更", agent_type="code_review")
         await session.commit()
     return {"finding_id": finding_id, "hitl_status": "rejected"}
+
+
+# ───────────────────────── doc_insight 编排 ─────────────────────────
+# 簿记载体是 doc_tasks 单表（不进 conversations/messages/agent_runs）：
+# 洞察是单发任务无多轮会话，任务级观测字段（status/duration_ms/error_message）表内自带。
+DOC_CONTENT_MIN = 1        # 空文档流前拒绝
+DOC_CONTENT_MAX = 200_000  # 原文字符上限：约百页文档，再大应走文件存储+异步任务
+DOC_TITLE_LEN = 200        # 与 doc_tasks.title VARCHAR(200) 对齐
+
+
+@dataclass
+class DocRunContext:
+    """prepare_doc_insight 阶段产出的簿记上下文，stream_doc_insight 凭它执行图与写回。"""
+    task_id: str
+    title: str
+    content: str
+
+
+async def prepare_doc_insight(user_id: str, title: str, content: str) -> DocRunContext:
+    """流开始前全部校验与落库：标题/正文合法性、建 doc_tasks(running)。
+    失败抛业务异常（endpoint 映射 HTTP 码），此时 SSE 尚未开始。
+    不挂 repo_id：文档洞察面向任意上传文档，与仓库无关。"""
+    title = (title or "").strip()
+    content = content or ""
+    if not title:
+        raise InvalidInputError("文档标题不能为空", agent_type="doc_insight")
+    if not content.strip():
+        raise InvalidInputError("文档内容不能为空", agent_type="doc_insight")
+    if len(content) > DOC_CONTENT_MAX:
+        raise InvalidInputError(
+            f"文档过长（{len(content)} 字符，上限 {DOC_CONTENT_MAX}），请拆分后分批洞察",
+            agent_type="doc_insight")
+
+    async with AsyncSessionLocal() as session:
+        task_id = str((await session.execute(text(
+            "INSERT INTO doc_tasks (user_id, title, content, status) "
+            "VALUES (:uid, :title, :content, 'running') RETURNING id"),
+            {"uid": uuid.UUID(user_id), "title": title[:DOC_TITLE_LEN],
+             "content": content})).scalar_one())
+        await session.commit()
+    return DocRunContext(task_id=task_id, title=title[:DOC_TITLE_LEN], content=content)
+
+
+async def stream_doc_insight(graph, ctx: DocRunContext):
+    """执行洞察图并产出 SSE 事件字典：meta -> progress*/token* -> done / error。
+    簿记（doc_tasks 写回）在本函数内完成；图内 map 节点已按块降级，
+    流级异常才走 AgentFallbackHandler。"""
+    yield {"event": "meta", "data": {"task_id": ctx.task_id, "title": ctx.title}}
+    cfg = make_config(ctx.task_id)  # 单发任务：thread_id 取 task id，checkpoint 仅供排障回看
+    graph_input = {"title": ctx.title, "content": ctx.content}
+    started = time.perf_counter()
+    failure: Exception | None = None
+    try:
+        async for ev in graph.astream_events(graph_input, config=cfg, version="v2"):
+            if ev["event"] != "on_custom_event":
+                continue
+            if ev["name"] == "doc_progress":
+                yield {"event": "progress", "data": ev["data"]}
+            elif ev["name"] == "doc_token":
+                yield {"event": "token", "data": {"text": ev["data"]["text"]}}
+    except Exception as e:  # noqa: BLE001 - 流内任何异常统一进失败收尾
+        failure = e
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
+    async with AsyncSessionLocal() as session:
+        if failure is not None:
+            logger.error("orchestrator.doc_stream_failed",
+                         task_id=ctx.task_id, error=str(failure))
+            fallback = await AgentFallbackHandler.handle("doc_insight", failure)
+            content = fallback.get("content") or "文档洞察服务暂时不可用，请稍后重试。"
+            await session.execute(text(
+                "UPDATE doc_tasks SET status = 'failed', error_message = :err, "
+                "duration_ms = :dur WHERE id = :tid"),
+                {"err": f"{type(failure).__name__}: {failure}"[:2000],
+                 "dur": duration_ms, "tid": uuid.UUID(ctx.task_id)})
+            await session.commit()
+            yield {"event": "error", "data": {"message": content}}
+            return
+
+        state = (await graph.aget_state(cfg)).values
+        task_error = state.get("error")
+        report = state.get("report") or ""
+        if task_error or not report.strip():  # map 全败，或报告为空：图正常结束但任务判失败
+            err = task_error or "报告生成失败（模型返回空内容）"
+            await session.execute(text(
+                "UPDATE doc_tasks SET status = 'failed', error_message = :err, "
+                "duration_ms = :dur WHERE id = :tid"),
+                {"err": err[:2000], "dur": duration_ms,
+                 "tid": uuid.UUID(ctx.task_id)})
+            await session.commit()
+            yield {"event": "error", "data": {"message": err}}
+            return
+
+        await session.execute(text(
+            "UPDATE doc_tasks SET status = 'success', report = :report, "
+            "duration_ms = :dur WHERE id = :tid"),
+            {"report": report, "dur": duration_ms, "tid": uuid.UUID(ctx.task_id)})
+        await session.commit()
+        yield {"event": "done",
+               "data": {"task_id": ctx.task_id, "report": report,
+                        "duration_ms": duration_ms}}

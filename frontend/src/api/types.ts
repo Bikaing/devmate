@@ -42,7 +42,15 @@ export interface HistoryMessage {
   msg_type: "text" | "diff" | "confirm_card" | "code_block" | "error";
   content: string;
   citations: Citation[] | null;
+  web_sources: WebSource[] | null;
   created_at: string;
+}
+
+// 联网搜索参考来源（与 citations 仓库引用契约分离）
+export interface WebSource {
+  title: string;
+  href: string;
+  body: string;
 }
 
 // 前端聊天窗内部使用的消息模型（兼容历史回放与流式增量）
@@ -52,6 +60,7 @@ export interface UiMessage {
   msgType: "text" | "error";
   content: string;
   citations?: Citation[];
+  webSources?: WebSource[];
   streaming?: boolean;
 }
 
@@ -101,4 +110,23 @@ export interface ReviewTask {
 export interface ReviewTaskDetail extends ReviewTask {
   review_basis: string | null;
   findings: ReviewFinding[];
+}
+
+// ── doc_insight 契约（与 backend/api/v1/doc_insight.py 返回体一一对应）──
+export type DocTaskStatus = "running" | "success" | "failed";
+
+// 列表不带 content/report 大字段
+export interface DocTask {
+  id: string;
+  title: string;
+  status: DocTaskStatus;
+  error_message: string | null;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+// 详情多原文与完整报告（历史回看用）
+export interface DocTaskDetail extends DocTask {
+  content: string;
+  report: string | null;
 }

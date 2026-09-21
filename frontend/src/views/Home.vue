@@ -39,10 +39,10 @@ const agents: AgentCard[] = [
   {
     key: "doc_insight",
     title: "文档洞察",
-    desc: "文档理解与知识抽取（规划中）",
+    desc: "上传 md/txt 文档，map-reduce 提炼要点并生成结构化洞察报告",
     icon: "Document",
     color: "#7c3aed",
-    enabled: false,
+    enabled: true,
   },
   {
     key: "incident_triage",
@@ -56,7 +56,9 @@ const agents: AgentCard[] = [
 
 function open(a: AgentCard) {
   if (!a.enabled) return;
-  router.push({ name: a.key === "code_review" ? "review" : "chat" });
+  const routeName = a.key === "code_review" ? "review"
+    : a.key === "doc_insight" ? "doc-insight" : "chat";
+  router.push({ name: routeName });
 }
 </script>
 
