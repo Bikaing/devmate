@@ -15,7 +15,7 @@ DevMate 是一个面向研发场景的多 Agent 助手，采用 **FastAPI + Lang
 
 ## 界面展示
 
-**工作台**：三个 Agent 卡片入口，一眼看清各能力定位。
+**工作台**：四个 Agent 卡片入口，一眼看清各能力定位。
 
 ![工作台](docs/images/home.png)
 
