@@ -13,6 +13,26 @@ DevMate 是一个面向研发场景的多 Agent 助手，采用 **FastAPI + Lang
 
 ---
 
+## 界面展示
+
+**工作台**：三个 Agent 卡片入口，一眼看清各能力定位。
+
+![工作台](docs/images/home.png)
+
+**代码问答**：RAG 流式回答，带引用溯源与联网搜索开关。
+
+![代码问答](docs/images/code-qa.png)
+
+**代码审查**：未提交变更 / 提交区间 / 单个提交三种模式，流式进度 + 总体摘要。
+
+![代码审查](docs/images/code-review.png)
+
+**文档洞察**：上传 md/txt 文档，map-reduce 流式生成结构化洞察报告。
+
+![文档洞察](docs/images/doc-insight.png)
+
+---
+
 ## 一、系统架构
 
 ```
