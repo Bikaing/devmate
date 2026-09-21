@@ -25,6 +25,11 @@ export async function listConversations(status = "active"): Promise<Conversation
   return data;
 }
 
+// 软删除会话（后端置 status=archived，列表默认只查 active）
+export async function deleteConversation(conversationId: string): Promise<void> {
+  await http.delete(`/code-qa/conversations/${conversationId}`);
+}
+
 export async function listMessages(conversationId: string): Promise<HistoryMessage[]> {
   const { data } = await http.get<HistoryMessage[]>(
     `/code-qa/conversations/${conversationId}/messages`,

@@ -83,6 +83,27 @@ async def list_conversations(
              "created_at": r.created_at.isoformat()} for r in rows]
 
 
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: UUID,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """软删除会话：status 置 archived，列表默认只查 active 即立即消失。
+    归档会话追加新消息会被 prepare_code_qa 拒绝（只读保护）；重复删除 409。"""
+    row = (await db.execute(text(
+        "SELECT status FROM conversations WHERE id = :cid AND user_id = :uid"),
+        {"cid": conversation_id, "uid": current_user["user_id"]})).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+    if row.status != "active":
+        raise HTTPException(status_code=409, detail="会话已删除")
+    await db.execute(text(
+        "UPDATE conversations SET status = 'archived' WHERE id = :cid"),
+        {"cid": conversation_id})
+    return {"id": str(conversation_id), "status": "archived"}
+
+
 @router.get("/conversations/{conversation_id}/messages")
 async def list_messages(
     conversation_id: UUID,

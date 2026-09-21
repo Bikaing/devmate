@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { listConversations, listRepos } from "@/api/codeQa";
+import { deleteConversation, listConversations, listRepos } from "@/api/codeQa";
 import type { Conversation, Repo } from "@/api/types";
 
 // 仓库与会话列表在侧边栏/首页/聊天页共享，集中到一个 store 拉取与缓存。
@@ -24,6 +24,11 @@ export const useChatStore = defineStore("chat", {
     },
     async loadConversations() {
       this.conversations = await listConversations();
+    },
+    // 软删除：后端归档后从本地列表摘除，调用方负责确认与错误提示
+    async removeConversation(id: string) {
+      await deleteConversation(id);
+      this.conversations = this.conversations.filter((c) => c.id !== id);
     },
     setActiveRepo(id: string) {
       this.activeRepoId = id;
