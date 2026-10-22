@@ -12,6 +12,10 @@ export async function registerRepo(path: string, name = ""): Promise<Repo> {
   return data;
 }
 
+export async function deleteRepo(repoId: string): Promise<void> {
+  await http.delete(`/repos/${repoId}`);
+}
+
 // 触发后台索引，立即返回 indexing，前端轮询 listRepos 看状态变化
 export async function triggerIndex(repoId: string): Promise<{ id: string; index_status: string }> {
   const { data } = await http.post(`/repos/${repoId}/index`);

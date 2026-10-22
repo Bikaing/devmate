@@ -8,9 +8,19 @@ models/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-fix-tests/
+.test-runtime/
+.cache/
 venv/
 
 # IDE / 操作系统
 .idea/
 .vscode/
 .DS_Store
+
+# 补充文档保存在桌面 docs，不在项目内新增
+/docs/
+
+# 测试文件仅保留本地，不同步到远程仓库
+/test/
+/tests/

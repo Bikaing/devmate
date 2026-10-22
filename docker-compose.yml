@@ -66,6 +66,10 @@ services:
     command: ["milvus", "run", "standalone"]
     environment:
       ETCD_ENDPOINTS: etcd:2379                 # 连内部 etcd
+      # 独立命名空间恢复异常的旧消息队列；旧 by-dev/files/rdb_data 数据仍保留。
+      ETCD_ROOTPATH: codepilot-index-v2
+      MINIO_ROOTPATH: codepilot-index-v2
+      ROCKSMQ_PATH: /var/lib/milvus/rdb_data_index_v2
       MINIO_ADDRESS: minio:9000                 # 连内部 MinIO
       MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}

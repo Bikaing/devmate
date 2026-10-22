@@ -39,7 +39,7 @@ const agents: AgentCard[] = [
   {
     key: "doc_insight",
     title: "文档洞察",
-    desc: "上传 md/txt 文档，map-reduce 提炼要点并生成结构化洞察报告",
+    desc: "上传 md/txt 文档，提炼要点并生成结构化洞察报告",
     icon: "Document",
     color: "#7c3aed",
     enabled: true,

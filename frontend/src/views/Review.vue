@@ -1,9 +1,11 @@
 <script setup lang="ts">
 // 代码审查页：发起表单（仓库/范围/依据）+ SSE 进度流 + findings 列表 + HitL apply/reject + 历史任务。
-import { onMounted, ref } from "vue";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { computed, onMounted, ref, watch } from "vue";
+import { ElMessage } from "element-plus";
+import FixPanel from '@/components/FixPanel.vue';
+import ReviewText from '@/components/ReviewText.vue';
 import {
-  applyFinding, getReviewTask, listReviewTasks, rejectFinding, streamReview,
+  getReviewTask, listReviewTasks, rejectFinding, streamReview,
 } from "@/api/codeReview";
 import { useChatStore } from "@/stores/chat";
 import type { ReviewFinding, ReviewMode, ReviewTask, ReviewTaskDetail } from "@/api/types";
@@ -24,6 +26,26 @@ const logs = ref<string[]>([]);
 const result = ref<ReviewTaskDetail | null>(null);
 const showHistory = ref(false);
 const tasks = ref<ReviewTask[]>([]);
+const findingLevel = ref<'all' | ReviewFinding['severity']>('critical');
+const findingCounts = computed(() => {
+  const findings = result.value?.findings || [];
+  return {
+    all: findings.length,
+    critical: findings.filter(f => f.severity === 'critical').length,
+    warning: findings.filter(f => f.severity === 'warning').length,
+    info: findings.filter(f => f.severity === 'info').length,
+  };
+});
+const visibleFindings = computed(() => (result.value?.findings || [])
+  .filter(f => findingLevel.value === 'all' || f.severity === findingLevel.value));
+
+watch(() => chat.repos.map((repo) => repo.id), (ids) => {
+  if (form.value.repo_id && !ids.includes(form.value.repo_id)) {
+    form.value.repo_id = chat.activeRepoId || ids[0] || '';
+    if (result.value && !ids.includes(result.value.repo_id)) result.value = null;
+    loadTasks();
+  }
+});
 
 const SEV_META: Record<string, { type: "danger" | "warning" | "info"; label: string }> = {
   critical: { type: "danger", label: "critical" },
@@ -45,8 +67,11 @@ function progressText(d: Record<string, unknown>): string {
       return `规则预检完成：${d.count} 条`;
     case "context":
       return `上下文装配完成：${d.count} 个文件`;
+    case "analysis":
+      return `分析 ${d.done}/${d.total}：${d.file}`
+        + (d.status === 'failed' ? '（失败）' : `（${d.evidence_count} 条代码证据）`);
     case "review":
-      return `审查 ${d.done}/${d.total}：${d.file}`;
+      return `审查 ${d.done}/${d.total}：${d.file}${d.status === 'failed' ? '（失败，未完成审查）' : ''}`;
     case "summarize":
       return "总体摘要已生成";
     default:
@@ -66,10 +91,14 @@ async function start() {
   running.value = true;
   logs.value = [];
   result.value = null;
+  let taskId = "";
   await streamReview(
     { ...form.value },
     {
-      onMeta: (d) => logs.value.push(`任务已创建：${d.task_id.slice(0, 8)}`),
+      onMeta: (d) => {
+        taskId = d.task_id;
+        logs.value.push(`任务已创建：${d.task_id.slice(0, 8)}`);
+      },
       onProgress: (d) => logs.value.push(progressText(d)),
       onComment: (d) => logs.value.push(`评论 ${d.file}：${d.findings.length} 条`),
       onDone: async (d) => {
@@ -79,10 +108,11 @@ async function start() {
         ElMessage.success(`审查完成：${d.findings.length} 条发现`);
         loadTasks();
       },
-      onError: (d) => {
+      onError: async (d) => {
         running.value = false;
         logs.value.push(`失败：${d.message}`);
         ElMessage.error(d.message);
+        if (taskId) result.value = await getReviewTask(taskId).catch(() => null);
         loadTasks();
       },
       onHttpError: (s, detail) => {
@@ -92,27 +122,6 @@ async function start() {
     },
   );
   running.value = false; // 流无 done/error 结束（断网等）的兜底
-}
-
-async function onApply(f: ReviewFinding) {
-  try {
-    await ElMessageBox.confirm(
-      `将把该补丁应用到仓库并自动提交（git apply + commit）。\n${f.file} L${f.start_line}-L${f.end_line}`,
-      "应用补丁",
-      { type: "warning", confirmButtonText: "应用并提交", cancelButtonText: "取消" },
-    );
-  } catch {
-    return; // 用户取消
-  }
-  try {
-    const r = await applyFinding(f.id);
-    f.hitl_status = "applied";
-    f.applied_commit = r.applied_commit;
-    ElMessage.success(`已应用并提交：${r.applied_commit.slice(0, 8)}`);
-  } catch (e) {
-    const err = e as { response?: { status: number; data?: { detail?: string } } };
-    ElMessage.error(err.response?.data?.detail || "应用失败");
-  }
 }
 
 async function onReject(f: ReviewFinding) {
@@ -208,7 +217,7 @@ onMounted(() => {
               </el-tag>
             </div>
           </template>
-          <p class="summary">{{ result.summary || result.error_message || "(无摘要)" }}</p>
+          <ReviewText class="summary" :text="result.summary || result.error_message || '(无摘要)'" />
           <p v-if="result.diff_stats?.files !== undefined" class="stats">
             {{ result.diff_stats.files }} 个文件变更，+{{ result.diff_stats.added }}
             -{{ result.diff_stats.deleted }}
@@ -221,33 +230,49 @@ onMounted(() => {
           </p>
         </el-card>
 
-        <div v-if="!result.findings.length" class="no-finding">未发现问题 🎉</div>
-        <el-card v-for="f in result.findings" :key="f.id" shadow="never" class="finding-card">
+        <div class="finding-filter">
+          <span class="filter-label">问题级别</span>
+          <el-select v-model="findingLevel" aria-label="选择问题卡片展示级别" style="width: 210px">
+            <el-option :label="`critical（${findingCounts.critical}）`" value="critical" />
+            <el-option :label="`warning（${findingCounts.warning}）`" value="warning" />
+            <el-option :label="`info（${findingCounts.info}）`" value="info" />
+            <el-option :label="`全部级别（${findingCounts.all}）`" value="all" />
+          </el-select>
+          <span class="filter-count">展示 {{ visibleFindings.length }} / {{ findingCounts.all }} 条 · 摘要仅包含 critical 风险</span>
+        </div>
+        <div v-if="result.status === 'success' && !visibleFindings.length" class="no-finding">
+          {{ findingCounts.all ? '当前级别暂无问题，可切换级别查看其他发现。' : '本次审查未发现问题。' }}
+        </div>
+        <el-alert v-if="result.status === 'failed'" title="审查未完成，不能据此判断代码没有问题。请查看失败原因后重试。"
+          type="error" :closable="false" show-icon />
+        <el-card v-for="f in visibleFindings" :key="f.id" shadow="never" class="finding-card">
           <div class="finding-head">
+            <div class="finding-meta">
             <el-tag :type="SEV_META[f.severity]?.type" size="small" effect="dark">{{ f.severity }}</el-tag>
             <el-tag size="small" effect="plain">{{ f.category }}</el-tag>
             <el-tag size="small" effect="plain" :type="f.source === 'rule' ? 'warning' : 'success'">
               {{ f.source === "rule" ? "规则" : "AI" }}
             </el-tag>
             <code class="loc">{{ f.file }} L{{ f.start_line }}-L{{ f.end_line }}</code>
-            <span class="spacer" />
+            </div>
+            <div class="finding-actions">
+            <FixPanel :finding-id="f.id" :pending="f.hitl_status === 'pending'"
+              @applied="f.hitl_status = 'applied'; f.applied_commit = null" />
             <template v-if="f.hitl_status === 'pending'">
-              <el-button
-                size="small"
-                type="primary"
-                :disabled="!f.suggested_diff"
-                @click="onApply(f)"
-              >应用补丁</el-button>
               <el-button size="small" @click="onReject(f)">拒绝</el-button>
             </template>
             <el-tag v-else :type="f.hitl_status === 'applied' ? 'success' : 'info'" size="small">
               {{ f.hitl_status === "applied"
-                ? `已应用 ${String(f.applied_commit).slice(0, 8)}` : "已拒绝" }}
+                ? (f.applied_commit ? `已应用 ${f.applied_commit.slice(0, 8)}` : '已应用到工作树') : "已拒绝" }}
             </el-tag>
+            </div>
           </div>
-          <div class="finding-title">{{ f.title }}</div>
-          <p class="finding-suggestion">{{ f.suggestion }}</p>
-          <pre v-if="f.suggested_diff" class="diff">{{ f.suggested_diff }}</pre>
+          <h3 class="finding-title">{{ f.title }}</h3>
+          <ReviewText :text="f.suggestion" />
+          <details v-if="f.suggested_diff" class="patch-preview">
+            <summary>查看建议补丁</summary>
+            <pre class="diff">{{ f.suggested_diff }}</pre>
+          </details>
           <div v-else-if="f.hitl_status === 'pending'" class="no-diff">
             该发现无自动补丁（参考文字建议人工修复）
           </div>
@@ -288,6 +313,7 @@ onMounted(() => {
 .panel {
   overflow-y: auto;
   min-height: 0;
+  min-width: 0;
 }
 .panel-head {
   display: flex;
@@ -307,29 +333,37 @@ onMounted(() => {
   line-height: 1.9;
 }
 .summary {
-  margin: 0 0 8px;
-  line-height: 1.7;
-  white-space: pre-wrap;
+  margin: 0 0 20px;
 }
 .stats {
   margin: 0;
   color: #6b7280;
   font-size: 13px;
+  border-top: 1px solid #eef2f6;
+  padding-top: 14px;
+  line-height: 1.8;
 }
 .no-finding {
   margin-top: 24px;
   text-align: center;
   color: #6b7280;
 }
+.finding-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 18px 0 8px; }
+.filter-label { font-size: 14px; font-weight: 600; color: #334155; }
+.filter-count { color: #64748b; font-size: 12px; }
 .finding-card {
-  margin-top: 12px;
+  margin-top: 16px;
 }
 .finding-head {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
   flex-wrap: wrap;
 }
+.finding-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; flex: 1 1 280px; }
+.finding-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
+.finding-actions :deep(.el-button + .el-button) { margin-left: 0; }
 .loc {
   font-family: Consolas, Menlo, monospace;
   font-size: 12px;
@@ -337,20 +371,17 @@ onMounted(() => {
   background: #f3f4f6;
   padding: 2px 6px;
   border-radius: 4px;
-}
-.spacer {
-  flex: 1;
+  overflow-wrap: anywhere;
 }
 .finding-title {
-  margin-top: 10px;
+  margin: 18px 0 12px;
+  color: #1e293b;
+  font-size: 16px;
+  line-height: 1.65;
   font-weight: 600;
 }
-.finding-suggestion {
-  margin: 6px 0 0;
-  color: #4b5563;
-  line-height: 1.7;
-  white-space: pre-wrap;
-}
+.patch-preview { margin-top: 18px; border-top: 1px solid #eef2f6; padding-top: 14px; }
+.patch-preview summary { cursor: pointer; color: #2563eb; font-size: 13px; width: fit-content; }
 .diff {
   margin: 10px 0 0;
   padding: 10px 12px;
@@ -361,6 +392,7 @@ onMounted(() => {
   font-size: 12px;
   line-height: 1.6;
   overflow-x: auto;
+  max-height: 420px;
 }
 .no-diff {
   margin-top: 8px;
@@ -369,5 +401,13 @@ onMounted(() => {
 }
 .history-table {
   cursor: pointer;
+}
+@media (max-width: 1000px) {
+  .review { grid-template-columns: 300px minmax(0, 1fr); padding: 16px; }
+}
+@media (max-width: 760px) {
+  .review { display: block; overflow-y: auto; }
+  .panel { overflow: visible; }
+  .result-panel { margin-top: 16px; }
 }
 </style>

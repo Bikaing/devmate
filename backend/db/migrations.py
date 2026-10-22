@@ -4,6 +4,7 @@
 # 模式：DDL 分布式定义（各 Agent 模块的 schema.py 纯常量）+ 集中式收集执行（本文件）。
 from sqlalchemy import text
 
+from backend.agents.code_review.fix import schema as code_fix_schema
 from backend.agents.code_qa import schema as code_qa_schema
 from backend.agents.code_review import schema as code_review_schema
 from backend.agents.doc_insight import schema as doc_insight_schema
@@ -25,6 +26,7 @@ _CORE_MIGRATIONS: list[tuple[str, str]] = [
 _AGENT_SCHEMA_MODULES = [
     code_qa_schema,
     code_review_schema,
+    code_fix_schema,
     doc_insight_schema,
 ]
 

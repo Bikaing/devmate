@@ -116,3 +116,6 @@ MIGRATIONS: list[tuple[str, str]] = [
         """,
     ),
 ]
+
+MIGRATIONS += [('code_review.analyses',
+    "ALTER TABLE review_tasks ADD COLUMN IF NOT EXISTS analyses JSONB NOT NULL DEFAULT '{}'::jsonb")]

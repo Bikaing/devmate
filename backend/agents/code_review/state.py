@@ -26,6 +26,7 @@ class ReviewState(TypedDict, total=False):
     # ── rules / context 节点产物 ──
     rule_findings: list[dict]  # 规则预检 findings（source='rule'，suggested_diff=None）
     contexts: dict             # {path: [{path, start_line, end_line, content}]}；未索引/召回失败为空 dict
+    analyses: dict             # {path: {changed_behavior, dependencies, review_focus, unknowns, evidence, ...}}
 
     # ── review / summarize 节点产物 ──
     findings: list[dict]  # 最终 findings：rule + llm 去重合并后的完整契约结构

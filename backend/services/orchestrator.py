@@ -12,7 +12,6 @@ from dataclasses import dataclass
 
 from sqlalchemy import text
 
-from backend.agents.code_review.applier import apply_finding_patch
 from backend.core.exceptions import (InvalidInputError, RepoNotIndexedError,
                                      ReviewHitlStateError)
 from backend.core.logger import get_logger
@@ -45,7 +44,7 @@ async def prepare_code_qa(user_id: str, repo_id: str,
     async with AsyncSessionLocal() as session:
         # 1. 仓库归属 + 索引就绪校验（隔离轴 repo_id 的权限落地）
         repo = (await session.execute(text(
-            "SELECT index_status FROM repos WHERE id = :rid AND user_id = :uid"),
+            "SELECT index_status FROM repos WHERE id = :rid AND user_id = :uid FOR KEY SHARE"),
             {"rid": uuid.UUID(repo_id), "uid": uuid.UUID(user_id)})).first()
         if repo is None:
             raise InvalidInputError("仓库不存在或无权访问", agent_type="code_qa")
@@ -204,7 +203,7 @@ async def prepare_review(user_id: str, repo_id: str, mode: str, base_ref: str = 
 
     async with AsyncSessionLocal() as session:
         repo = (await session.execute(text(
-            "SELECT path FROM repos WHERE id = :rid AND user_id = :uid"),
+            "SELECT path FROM repos WHERE id = :rid AND user_id = :uid FOR KEY SHARE"),
             {"rid": uuid.UUID(repo_id), "uid": uuid.UUID(user_id)})).first()
         if repo is None:
             raise InvalidInputError("仓库不存在或无权访问", agent_type="code_review")
@@ -232,6 +231,16 @@ async def stream_review(graph, ctx: ReviewRunContext):
     started = time.perf_counter()
     failure: Exception | None = None
     try:
+        # 记录实际审查输入；历史可变 ref 固定为 commit，修复前再次比较 tree。
+        from backend.agents.code_review.fix.workspace import capture_source
+        commit, tree = await asyncio.to_thread(capture_source, ctx.repo_path, ctx.mode, ctx.head_ref)
+        if ctx.mode != 'uncommitted':
+            graph_input['head_ref'] = commit
+        async with AsyncSessionLocal() as session:
+            await session.execute(text(
+                'UPDATE review_tasks SET input_commit=:commit, input_tree=:tree WHERE id=:id'),
+                {'commit': commit, 'tree': tree, 'id': uuid.UUID(ctx.task_id)})
+            await session.commit()
         async for ev in graph.astream_events(graph_input, config=cfg, version="v2"):
             if ev["event"] != "on_custom_event":
                 continue
@@ -239,6 +248,10 @@ async def stream_review(graph, ctx: ReviewRunContext):
                 yield {"event": "progress", "data": ev["data"]}
             elif ev["name"] == "review_comment":
                 yield {"event": "comment", "data": ev["data"]}
+        if ctx.mode == 'uncommitted':
+            end_commit, end_tree = await asyncio.to_thread(capture_source, ctx.repo_path, ctx.mode)
+            if (end_commit, end_tree) != (commit, tree):
+                raise InvalidInputError('审查期间仓库内容发生变化，请重新审查', agent_type='code_review')
     except Exception as e:  # noqa: BLE001 - 流内任何异常统一进失败收尾
         failure = e
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -261,6 +274,10 @@ async def stream_review(graph, ctx: ReviewRunContext):
             return
 
         state = (await graph.aget_state(cfg)).values
+        await session.execute(text(
+            'UPDATE review_tasks SET analyses=CAST(:analyses AS jsonb) WHERE id=:tid'),
+            {'analyses': json.dumps(state.get('analyses') or {}, ensure_ascii=False),
+             'tid': uuid.UUID(ctx.task_id)})
         task_error = state.get("error")
         if task_error:  # diff 节点失败：图正常结束但任务判失败
             await session.execute(text(
@@ -305,44 +322,35 @@ async def _load_finding(session, user_id: str, finding_id: str):
         "FROM review_findings f "
         "JOIN review_tasks t ON t.id = f.task_id "
         "JOIN repos r ON r.id = t.repo_id "
-        "WHERE f.id = :fid AND t.user_id = :uid"),
+        "WHERE f.id = :fid AND t.user_id = :uid FOR UPDATE OF f"),
         {"fid": uuid.UUID(finding_id), "uid": uuid.UUID(user_id)})).first()
     if row is None:
         raise InvalidInputError("finding 不存在或无权访问", agent_type="code_review")
     return row
 
 
+async def _ensure_no_active_fix(session, finding_id: str) -> None:
+    active = (await session.execute(text(
+        "SELECT id FROM fix_tasks WHERE finding_id=:fid "
+        "AND status IN ('pending','preparing','analyzing','fixing','validating','ready') LIMIT 1"),
+        {'fid': uuid.UUID(finding_id)})).first()
+    if active:
+        raise ReviewHitlStateError('请先取消或完成该问题的修复任务', agent_type='code_review')
+
+
 async def apply_finding(user_id: str, finding_id: str) -> dict:
-    """HitL 应用补丁：applier 预检+apply+commit，成功后落 applied + commit hash。
-    冲突抛 ReviewApplyConflictError（endpoint 409，finding 保持 pending）。"""
+    """保留旧接口以返回迁移提示，禁止直接应用未验证的审查建议。"""
     async with AsyncSessionLocal() as session:
-        row = await _load_finding(session, user_id, finding_id)
-        if row.hitl_status != "pending":
-            raise ReviewHitlStateError(
-                f"finding 已 {row.hitl_status}，不可重复 apply", agent_type="code_review")
-        if not row.suggested_diff:
-            raise InvalidInputError(
-                "该 finding 无补丁（suggested_diff 为空），不能自动应用", agent_type="code_review")
-        msg = (f"fix(code_review): {row.title} "
-               f"({row.file} L{row.start_line}-L{row.end_line})")[:200]
-        sha = await apply_finding_patch(row.path, row.suggested_diff, msg)
-        res = await session.execute(text(
-            "UPDATE review_findings SET hitl_status = 'applied', applied_commit = :sha "
-            "WHERE id = :fid AND hitl_status = 'pending'"),
-            {"sha": sha, "fid": uuid.UUID(finding_id)})
-        if res.rowcount == 0:  # 并发 reject 抢先：commit 已落库，如实记录并报错待人工核对
-            logger.error("orchestrator.apply_race", finding_id=finding_id, commit=sha)
-            raise ReviewHitlStateError(
-                "finding 状态已被并发变更，但补丁已提交", agent_type="code_review",
-                details={"commit": sha})
-        await session.commit()
-    return {"finding_id": finding_id, "hitl_status": "applied", "applied_commit": sha}
+        await _load_finding(session, user_id, finding_id)
+        await _ensure_no_active_fix(session, finding_id)
+        raise ReviewHitlStateError('请先尝试修复并验证，再从修复结果确认应用', agent_type='code_review')
 
 
 async def reject_finding(user_id: str, finding_id: str) -> dict:
     """HitL 拒绝建议：仅 pending 可拒，条件更新防并发双写。"""
     async with AsyncSessionLocal() as session:
         row = await _load_finding(session, user_id, finding_id)
+        await _ensure_no_active_fix(session, finding_id)
         if row.hitl_status != "pending":
             raise ReviewHitlStateError(
                 f"finding 已 {row.hitl_status}，不可重复 reject", agent_type="code_review")

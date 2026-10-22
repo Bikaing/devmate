@@ -17,9 +17,9 @@ export const useChatStore = defineStore("chat", {
   actions: {
     async loadRepos() {
       this.repos = await listRepos();
-      if (!this.activeRepoId && this.repos.length) {
+      if (!this.repos.some((r) => r.id === this.activeRepoId)) {
         const preferred = this.repos.find((r) => r.index_status === "indexed");
-        this.activeRepoId = (preferred || this.repos[0]).id;
+        this.activeRepoId = (preferred || this.repos[0])?.id || '';
       }
     },
     async loadConversations() {

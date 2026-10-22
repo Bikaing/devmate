@@ -4,6 +4,7 @@
 # 前端轮询 GET /repos 观察 index_status 变化（pending/indexing -> indexed/failed）。
 import asyncio
 import os
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -12,7 +13,9 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.agents.code_qa.indexer import index_repo
 from backend.core.logger import get_logger
+from backend.core.knowledge_base import VectorStore
 from backend.dependencies import get_current_user, get_db
+from backend.services.code_fix import running_task_ids
 
 router = APIRouter(prefix="/repos", tags=["repos"])
 logger = get_logger(__name__)
@@ -93,3 +96,45 @@ async def trigger_index(
 
     asyncio.create_task(_index_background(repo_id))
     return {"id": repo_id, "index_status": "indexing"}
+
+
+@router.delete('/{repo_id}', status_code=204)
+async def delete_repo(repo_id: UUID, current_user: dict = Depends(get_current_user), db=Depends(get_db)):
+    """删除登记、索引和级联审查记录；不删除磁盘目录及问答历史。"""
+    params = {'rid': repo_id, 'uid': UUID(current_user['user_id'])}
+    row = (await db.execute(text(
+        'SELECT id,index_status FROM repos WHERE id=:rid AND user_id=:uid FOR UPDATE'), params)).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail='仓库不存在或无权访问')
+    if row.index_status == 'indexing':
+        raise HTTPException(status_code=409, detail='仓库正在索引，请等待完成后再删除')
+    # 与新建审查/问答的外键锁、修复入口的 finding 行锁协调。
+    await db.execute(text('SELECT id FROM review_tasks WHERE repo_id=:rid FOR UPDATE'), params)
+    await db.execute(text(
+        'SELECT f.id FROM review_findings f JOIN review_tasks t ON t.id=f.task_id '
+        'WHERE t.repo_id=:rid FOR UPDATE OF f'), params)
+    params['jobs'] = [UUID(task_id) for task_id in running_task_ids()]
+    active = (await db.execute(text(
+        "SELECT 1 FROM review_tasks WHERE repo_id=:rid AND status='running' "
+        "UNION ALL SELECT 1 FROM agent_runs WHERE repo_id=:rid AND status IN ('running','awaiting_confirm') "
+        'UNION ALL SELECT 1 FROM fix_tasks x JOIN review_findings f ON f.id=x.finding_id '
+        'JOIN review_tasks t ON t.id=f.task_id WHERE t.repo_id=:rid '
+        "AND (x.status IN ('pending','preparing','analyzing','fixing','validating','ready') "
+        'OR x.id=ANY(CAST(:jobs AS uuid[]))) LIMIT 1'), params)).first()
+    if active:
+        raise HTTPException(status_code=409, detail='仓库有运行中或待确认的任务，请先完成或取消后再删除')
+    try:
+        await asyncio.to_thread(VectorStore.delete_repo, str(repo_id))
+    except Exception:
+        logger.exception('repos.delete_vectors_failed', repo_id=str(repo_id))
+        raise HTTPException(status_code=503, detail='向量索引清理失败，仓库记录已保留，请稍后重试')
+    try:
+        await db.execute(text('DELETE FROM repos WHERE id=:rid AND user_id=:uid'), params)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        # 跨库提交不能原子化：若删除记录失败，标记为待恢复，避免继续使用缺失向量。
+        await db.execute(text("UPDATE repos SET index_status='failed' WHERE id=:rid AND user_id=:uid"), params)
+        await db.commit()
+        logger.exception('repos.delete_record_failed', repo_id=str(repo_id))
+        raise HTTPException(status_code=503, detail='仓库记录删除失败，请重试删除或重新索引')

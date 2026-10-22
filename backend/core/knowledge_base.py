@@ -3,6 +3,7 @@
 # 约定：各 Agent 统一通过本模块获取嵌入/精排/向量库能力，禁止直接调底层库。
 import threading
 import time
+import json
 from dataclasses import dataclass, field
 
 import torch
@@ -13,12 +14,12 @@ from sentence_transformers import CrossEncoder
 from backend.config import get_settings
 from backend.core.exceptions import MilvusConnectionError
 from backend.core.logger import get_logger
+from backend.core.embedding_cache import EmbeddingCache, model_fingerprint
 
 logger = get_logger(__name__)
 
 COLLECTION_NAME = "code_chunks"  # 与 PG 表同名，存放子块向量
 DENSE_DIM = 1024                 # BGE-M3 稠密向量固定维度
-EMBED_BATCH_SIZE = 16            # 编码批大小，过大会内存尖峰
 EMBED_MAX_LENGTH = 512           # BGE-M3 最大 token 长度，超出截断
 
 
@@ -34,6 +35,7 @@ class Embedder:
 
     _model: BGEM3FlagModel | None = None
     _lock = threading.Lock()
+    _encode_lock = threading.Lock()
 
     @classmethod
     def _load(cls) -> BGEM3FlagModel:
@@ -50,12 +52,57 @@ class Embedder:
 
     @classmethod
     def encode(cls, texts: list[str]) -> list[EmbeddedText]:
-        """批量编码：同时返回 dense（1024 维）与 sparse（词法权重），供混合检索使用。"""
+        """相同文本只编码一次；缓存不依赖仓库、文件路径或切片位置。"""
         if not texts:
             return []
+        started = time.perf_counter()
+        settings = get_settings()
+        unique = list(dict.fromkeys(texts))
+        cache = None
+        found = {}
+        try:
+            if settings.embedding_cache_path:
+                cache = EmbeddingCache(settings.embedding_cache_path, model_fingerprint(
+                    settings.bge_m3_model_path, 'cuda-fp16' if torch.cuda.is_available() else 'cpu-fp32',
+                    EMBED_MAX_LENGTH), settings.embedding_cache_max_entries)
+                found = cache.get_many(unique)
+        except Exception as exc:
+            logger.warning('knowledge_base.embedding_cache_unavailable', error=str(exc))
+            cache = None
+        misses = [t for t in unique if t not in found]
+        computed = 0
+        if misses:
+            # 串行推理避免并发索引/查询争抢内存；排队后复查其他请求刚写入的缓存。
+            with cls._encode_lock:
+                if cache:
+                    try:
+                        found.update(cache.get_many(misses))
+                    except Exception as exc:
+                        logger.warning('knowledge_base.embedding_cache_read_failed', error=str(exc))
+                misses = [t for t in unique if t not in found]
+                if misses:
+                    outputs = cls._encode_uncached(misses)
+                    if len(outputs) != len(misses):
+                        raise ValueError('向量化结果数量不一致')
+                    values = {t: (e.dense, e.sparse) for t, e in zip(misses, outputs)}
+                    computed = len(misses)
+                    found.update(values)
+                    if cache:
+                        try:
+                            cache.put_many(values)
+                        except Exception as exc:
+                            logger.warning('knowledge_base.embedding_cache_write_failed', error=str(exc))
+        logger.info('knowledge_base.embedding_done', texts=len(texts), unique=len(unique),
+                    computed=computed, cache_hits=len(unique) - computed,
+                    seconds=round(time.perf_counter() - started, 3))
+        return [EmbeddedText(dense=list(found[t][0]), sparse=dict(found[t][1])) for t in texts]
+
+    @classmethod
+    def _encode_uncached(cls, texts: list[str]) -> list[EmbeddedText]:
+        """真正运行 BGE-M3；保持原有长度、dense/sparse 和精度配置。"""
         out = cls._load().encode(
             texts,
-            batch_size=EMBED_BATCH_SIZE,
+            batch_size=get_settings().embedding_batch_size,
             max_length=EMBED_MAX_LENGTH,
             return_dense=True,
             return_sparse=True,
@@ -116,11 +163,11 @@ class VectorStore:
         return cls._client
 
     @classmethod
-    def ensure_collection(cls) -> None:
+    def ensure_collection(cls, collection_name: str = COLLECTION_NAME) -> None:
         """幂等建 collection：dense(HNSW/COSINE) + sparse(倒排/IP) 双索引。
         Milvus 2.4 的 schema 建好后不能加字段，故 sparse 字段一次到位。"""
         client = cls.get_client()
-        if client.has_collection(COLLECTION_NAME):
+        if client.has_collection(collection_name):
             return
         schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
         schema.add_field("vector_id", DataType.VARCHAR, is_primary=True, max_length=64)
@@ -136,10 +183,26 @@ class VectorStore:
                                params={"M": 16, "efConstruction": 200})
         index_params.add_index(field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="IP")
         client.create_collection(
-            collection_name=COLLECTION_NAME, schema=schema, index_params=index_params,
+            collection_name=collection_name, schema=schema, index_params=index_params,
             consistency_level="Strong",  # 默认 Bounded 有数秒读延迟，索引对账会误报，改强一致
+            timeout=30,
         )
-        logger.info("knowledge_base.collection_created", collection=COLLECTION_NAME)
+        logger.info("knowledge_base.collection_created", collection=collection_name)
+
+    @classmethod
+    def check_ready(cls) -> None:
+        """在耗时向量化之前检查实际可读性；容器健康不代表通道可用。"""
+        try:
+            cls.ensure_collection()
+            cls.get_client().query(
+                collection_name=COLLECTION_NAME, filter="chunk_index >= 0",
+                output_fields=["count(*)"], timeout=10,
+            )
+        except Exception as exc:
+            raise MilvusConnectionError(
+                "Milvus 集合暂不可用，请检查通道订阅和集合加载状态；"
+                "可使用 scripts/rebuild_vector_index.py 从 PostgreSQL 恢复索引。"
+            ) from exc
 
     @classmethod
     def upsert_chunks(cls, rows: list[dict]) -> int:
@@ -147,16 +210,31 @@ class VectorStore:
         if not rows:
             return 0
         cls.ensure_collection()
-        cls.get_client().upsert(collection_name=COLLECTION_NAME, data=rows)
+        for start in range(0, len(rows), 128):
+            cls.get_client().upsert(collection_name=COLLECTION_NAME, data=rows[start:start + 128], timeout=30)
         return len(rows)
 
     @classmethod
     def delete_by_file(cls, repo_id: str, file_id: str) -> None:
         """文件级清理旧向量（增量索引「先删后插」的删除步）。"""
-        cls.get_client().delete(
-            collection_name=COLLECTION_NAME,
-            filter=f'repo_id == "{repo_id}" and file_id == "{file_id}"',
-        )
+        cls.delete_by_files(repo_id, [file_id])
+
+    @classmethod
+    def delete_by_files(cls, repo_id: str, file_ids: list[str]) -> None:
+        """按仓库隔离批量删除，避免逐文件的远程查询往返。"""
+        ids = list(dict.fromkeys(file_ids))
+        for start in range(0, len(ids), 128):
+            cls.get_client().delete(collection_name=COLLECTION_NAME,
+                filter=f'repo_id == {json.dumps(repo_id)} and file_id in {json.dumps(ids[start:start + 128])}',
+                timeout=15)
+
+    @classmethod
+    def delete_repo(cls, repo_id: str) -> None:
+        """仅清理指定仓库的向量；未创建集合时不额外创建。"""
+        client = cls.get_client()
+        if client.has_collection(COLLECTION_NAME):
+            client.delete(collection_name=COLLECTION_NAME,
+                          filter=f'repo_id == {json.dumps(repo_id)}', timeout=30)
 
     @classmethod
     def count(cls, repo_id: str | None = None) -> int:

@@ -29,6 +29,8 @@ _HTTP_SYNC_CLIENT = httpx.Client(
 # ── Agent 类型 → 模型标识符 的路由表 ──
 # 给某类业务换模型，只改这里一行即可。
 _AGENT_MODEL_ROUTING: dict[str, str] = {
+    "code_analysis": "deepseek-coder",
+    "code_fix": "deepseek-coder",
     "code_qa": "deepseek-coder",         # 代码库问答：代码理解为主
     "code_review": "deepseek-coder",     # 代码审查：安全/逻辑审查 + 修复 diff
     "doc_insight": "deepseek-chat",      # 文档洞察：长文提炼与报告生成
@@ -113,8 +115,13 @@ class LLMFactory:
     ) -> Runnable:
         """获取「绑定了结构化输出 Schema」的模型。"""
         llm = cls.get_llm(agent_type, temperature=temperature)
-        # 绑定 Pydantic 结构；method="function_calling" 是 DeepSeek 必须的
-        return llm.with_structured_output(output_schema, method="function_calling")
+        # function_calling 会强制选择 schema 对应工具。DeepSeek 思考模式
+        # 不支持指定 tool_choice，因此仅为结构化调用关闭思考模式。
+        # 复制配置，避免污染 get_llm 缓存中的普通对话/工具调用实例。
+        extra_body = dict(getattr(llm, "extra_body", None) or {})
+        extra_body["thinking"] = {"type": "disabled"}
+        structured_model = llm.model_copy(update={"extra_body": extra_body})
+        return structured_model.with_structured_output(output_schema, method="function_calling")
 
     @classmethod
     def clear_cache(cls) -> None:

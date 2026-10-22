@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onUnmounted, reactive, ref, watch } from "vue";
-import { ElMessage } from "element-plus";
-import { registerRepo, triggerIndex } from "@/api/codeQa";
+import { ElMessage, ElMessageBox } from "element-plus";
+import { deleteRepo, registerRepo, triggerIndex } from "@/api/codeQa";
 import { useChatStore } from "@/stores/chat";
 import type { IndexStatus, Repo } from "@/api/types";
 
@@ -11,6 +11,7 @@ const emit = defineEmits<{ (e: "update:modelValue", v: boolean): void; (e: "chan
 const chat = useChatStore();
 const form = reactive({ path: "", name: "" });
 const registering = ref(false);
+const deleting = ref<string[]>([]);
 
 const STATUS_META: Record<IndexStatus, { label: string; type: "success" | "warning" | "info" | "danger" }> = {
   indexed: { label: "已索引", type: "success" },
@@ -88,6 +89,28 @@ async function onIndex(r: Repo) {
     ElMessage.error(err.response?.data?.detail || "触发索引失败");
   }
 }
+
+async function onDelete(r: Repo) {
+  if (deleting.value.includes(r.id)) return;
+  try {
+    await ElMessageBox.confirm(
+      `删除「${r.name}」的登记、代码索引及关联审查/修复记录？本地代码目录和已有问答会话会保留。此操作不可撤销。`,
+      '删除仓库', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+    );
+  } catch { return; }
+  deleting.value.push(r.id);
+  try {
+    await deleteRepo(r.id);
+    await chat.loadRepos();
+    emit('changed');
+    ElMessage.success('仓库登记及关联索引已删除，本地代码已保留');
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { detail?: string } } };
+    ElMessage.error(err.response?.data?.detail || '删除失败，请刷新后重试');
+  } finally {
+    deleting.value = deleting.value.filter((id) => id !== r.id);
+  }
+}
 </script>
 
 <template>
@@ -115,10 +138,14 @@ async function onIndex(r: Repo) {
           plain
           size="small"
           :loading="r.index_status === 'indexing'"
-          :disabled="r.index_status === 'indexing'"
+          :disabled="r.index_status === 'indexing' || deleting.includes(r.id)"
           @click="onIndex(r)"
         >
           {{ r.index_status === "indexed" ? "重新索引" : "索引" }}
+        </el-button>
+        <el-button type="danger" plain size="small" :loading="deleting.includes(r.id)"
+          :disabled="r.index_status === 'indexing' || deleting.includes(r.id)" @click="onDelete(r)">
+          删除
         </el-button>
       </div>
     </div>

@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -144,31 +145,50 @@ def _split_file(f: _ScannedFile) -> list[_Chunk]:
     return chunks
 
 
+_SKIP_FILES = {'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml',
+               'yarn.lock', 'poetry.lock', 'uv.lock', 'Pipfile.lock', 'Cargo.lock',
+               'composer.lock', 'Gemfile.lock'}
+
+
+def _repo_file_paths(repo_path: str) -> list[str]:
+    """Git 仓库尊重 ignore，并保留未提交的新源码；非 Git 路径回退遍历。"""
+    try:
+        result = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+            cwd=repo_path, capture_output=True, timeout=15)
+        if result.returncode == 0:
+            return list(dict.fromkeys(p for p in result.stdout.decode('utf-8', 'replace').split('\0') if p))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    paths = []
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith('.')]
+        paths.extend(os.path.relpath(os.path.join(root, name), repo_path).replace(os.sep, '/') for name in files)
+    return paths
+
+
 def _scan_repo(repo_path: str) -> list[_ScannedFile]:
     out: list[_ScannedFile] = []
-    for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
-        for name in files:
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in _EXT_LANG:
+    for relative in _repo_file_paths(repo_path):
+        parts = relative.split('/')
+        if parts[-1] in _SKIP_FILES or any(p in _SKIP_DIRS or p.startswith('.') for p in parts[:-1]):
+            continue
+        ext = os.path.splitext(parts[-1])[1].lower()
+        if ext not in _EXT_LANG:
+            continue
+        full = os.path.join(repo_path, *parts)
+        try:
+            if os.path.islink(full) or os.path.getsize(full) > MAX_FILE_BYTES:
                 continue
-            full = os.path.join(root, name)
-            try:
-                if os.path.getsize(full) > MAX_FILE_BYTES:
-                    continue
-                with open(full, encoding="utf-8", errors="replace") as fh:
-                    content = fh.read()
-            except OSError:
-                continue
-            lang = _resolve_lang(_EXT_LANG[ext])
-            out.append(_ScannedFile(
-                path=os.path.relpath(full, repo_path).replace(os.sep, "/"),
-                language=lang.value if lang else ext.lstrip(".") or "text",
-                content=content,
-                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                token_count=_estimate_tokens(content),
-            ))
+            with open(full, encoding='utf-8', errors='replace') as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        lang = _resolve_lang(_EXT_LANG[ext])
+        out.append(_ScannedFile(path=relative, language=lang.value if lang else ext.lstrip('.') or 'text',
+            content=content, content_hash=hashlib.sha256(content.encode('utf-8')).hexdigest(),
+            token_count=_estimate_tokens(content)))
     return out
+
 
 
 def _git_head(repo_path: str) -> str | None:
@@ -194,28 +214,36 @@ def _git_diff_names(repo_path: str, anchor: str) -> list[str] | None:
         return None
 
 
-async def _claim_indexing(rid: uuid.UUID) -> tuple[str, str | None]:
-    """CAS 抢锁：仅 pending/indexed/failed 可进 indexing，防并发重复建；返回 (仓库路径, 增量锚点)。"""
+async def _claim_indexing(rid: uuid.UUID) -> tuple[str, str | None, bool]:
+    """行锁抢占任务，返回 (仓库路径, 增量锚点, 是否从失败状态恢复)。"""
     async with AsyncSessionLocal() as session:
         row = (await session.execute(text(
-            "UPDATE repos SET index_status='indexing' "
-            "WHERE id = :rid AND index_status IN ('pending','indexed','failed') "
-            "RETURNING path, last_indexed_commit"), {"rid": rid})).first()
-        if row is None:
+            "SELECT path, last_indexed_commit, index_status FROM repos "
+            "WHERE id = :rid FOR UPDATE"), {"rid": rid})).first()
+        if row is None or row[2] not in ('pending', 'indexed', 'failed'):
             raise IndexBuildError(f"仓库不存在或正在索引中: {rid}")
+        await session.execute(text(
+            "UPDATE repos SET index_status='indexing' WHERE id = :rid"), {"rid": rid})
         await session.commit()
-    return row[0], row[1]
+    return row[0], row[1], row[2] == 'failed'
 
 
 async def _run_index(repo_id: str, rid: uuid.UUID, repo_path: str,
-                     only_paths: set[str] | None) -> IndexSummary:
+                     only_paths: set[str] | None, *, rebuild: bool = False) -> IndexSummary:
     """索引执行体：扫描切片 -> 批量向量化 -> 先删后插写双库 -> 置状态。
     only_paths=None 为全量镜像（含删除文件）；非 None 只处理指定路径（增量）。
     先删后插天然幂等：崩溃重试重跑会再按文件清一次残向量。"""
     # 扫描切片
     summary = IndexSummary()
+    started = time.perf_counter()
     try:
+        # 失败可能留下跨库的部分写入，必须重新镜像整个仓库。
+        if rebuild:
+            only_paths = None
+        await asyncio.to_thread(VectorStore.check_ready)
         scanned = await asyncio.to_thread(_scan_repo, repo_path)
+        logger.info('code_qa.index_stage', repo_id=repo_id, stage='scan',
+                    seconds=round(time.perf_counter() - started, 3), files=len(scanned))
         if only_paths is not None:
             scanned = [f for f in scanned if f.path in only_paths]
         summary.files_scanned = len(scanned)
@@ -229,7 +257,8 @@ async def _run_index(repo_id: str, rid: uuid.UUID, repo_path: str,
         # 增量模式下范围外的文件不参与「消失判定」，避免误删未变更文件
         removed = [(path, fid) for path, (fid, _) in existing.items()
                    if path not in scanned_paths and (only_paths is None or path in only_paths)]
-        changed = [f for f in scanned if existing.get(f.path, ("", ""))[1] != f.content_hash]
+        changed = [f for f in scanned
+                   if rebuild or existing.get(f.path, ("", ""))[1] != f.content_hash]
         summary.files_unchanged = len(scanned) - len(changed)
         summary.files_removed = len(removed)
 
@@ -238,24 +267,34 @@ async def _run_index(repo_id: str, rid: uuid.UUID, repo_path: str,
             for path, file_id in removed:
                 await session.execute(
                     text("DELETE FROM code_files WHERE id = :fid"), {"fid": file_id})
-                await asyncio.to_thread(VectorStore.delete_by_file, repo_id, str(file_id))
+            if removed:
+                await asyncio.to_thread(VectorStore.delete_by_files, repo_id, [str(fid) for _, fid in removed])
             await session.commit()
 
         # 批量向量化
         chunks_by_path: dict[str, list[_Chunk]] = {f.path: _split_file(f) for f in changed}
         all_chunks = [c for cs in chunks_by_path.values() for c in cs]
+        embedding_started = time.perf_counter()
         embedded = await asyncio.to_thread(Embedder.encode, [c.content for c in all_chunks])
+        logger.info('code_qa.index_stage', repo_id=repo_id, stage='embedding',
+                    seconds=round(time.perf_counter() - embedding_started, 3), chunks=len(all_chunks))
+        if len(embedded) != len(all_chunks):
+            raise IndexBuildError("向量化结果数量与代码块数量不一致")
 
         # 先删后插，chunks写双库
+        write_started = time.perf_counter()
         async with AsyncSessionLocal() as session:
+            changed_file_ids = []
             for f in changed:
                 # 1. 写入/更新 code_files，拿到 file_id
                 file_id = (await session.execute(text(
-                    "INSERT INTO code_files (repo_id, path, language, content, content_hash, token_count, chunk_count) "
-                    "VALUES (:rid, :path, :lang, :content, :hash, :tokens, :nchunks) "
+                    "INSERT INTO code_files (id, repo_id, path, language, content, content_hash, token_count, chunk_count) "
+                    "VALUES (:fid, :rid, :path, :lang, :content, :hash, :tokens, :nchunks) "
                     "ON CONFLICT (repo_id, path) DO UPDATE SET language=EXCLUDED.language, content=EXCLUDED.content, "
                     "content_hash=EXCLUDED.content_hash, token_count=EXCLUDED.token_count, "
                     "chunk_count=EXCLUDED.chunk_count, indexed_at=NOW() RETURNING id"), {
+                        # 回滚后重试仍使用相同 ID，可以清理首次写入留下的残向量。
+                        "fid": uuid.uuid5(rid, f.path),
                         "rid": rid, "path": f.path, "lang": f.language, "content": f.content,
                         "hash": f.content_hash, "tokens": f.token_count,
                         "nchunks": len(chunks_by_path[f.path])})).scalar_one()
@@ -263,11 +302,14 @@ async def _run_index(repo_id: str, rid: uuid.UUID, repo_path: str,
                 # 2. 删除该文件的旧 chunks（PG + Milvus）
                 await session.execute(
                     text("DELETE FROM code_chunks WHERE file_id = :fid"), {"fid": file_id})
-                await asyncio.to_thread(VectorStore.delete_by_file, repo_id, str(file_id))
+                changed_file_ids.append(str(file_id))
 
                 # 3. 把 file_id 回填到 chunk 对象
                 for c in chunks_by_path[f.path]:
                     c.file_id = str(file_id)
+
+            if changed_file_ids:
+                await asyncio.to_thread(VectorStore.delete_by_files, repo_id, changed_file_ids)
 
             # 4. 批量插入新 chunks
             if all_chunks:
@@ -278,16 +320,17 @@ async def _run_index(repo_id: str, rid: uuid.UUID, repo_path: str,
                     [{"rid": rid, "fid": uuid.UUID(c.file_id), "idx": c.chunk_index, "sym": c.symbol_name,
                       "sline": c.start_line, "eline": c.end_line, "content": c.content,
                       "tokens": c.token_count, "vid": c.vector_id} for c in all_chunks])
+            # 向量成功后才提交文件哈希，避免失败后重试错误地跳过文件。
+            if all_chunks:
+                await asyncio.to_thread(VectorStore.upsert_chunks, [
+                    {"vector_id": c.vector_id, "repo_id": repo_id, "file_id": c.file_id,
+                     "chunk_index": c.chunk_index, "start_line": c.start_line, "end_line": c.end_line,
+                     "dense": e.dense, "sparse": e.sparse}
+                    for c, e in zip(all_chunks, embedded)])
             await session.commit()
 
-        # 5. 批量写入 Milvus
-        if all_chunks:
-            await asyncio.to_thread(VectorStore.upsert_chunks, [
-                {"vector_id": c.vector_id, "repo_id": repo_id, "file_id": c.file_id,
-                 "chunk_index": c.chunk_index, "start_line": c.start_line, "end_line": c.end_line,
-                 "dense": e.dense, "sparse": e.sparse}
-                for c, e in zip(all_chunks, embedded)])
-
+        logger.info('code_qa.index_stage', repo_id=repo_id, stage='write',
+                    seconds=round(time.perf_counter() - write_started, 3))
         summary.files_indexed = len(changed)
         summary.chunks_created = len(all_chunks)
         summary.total_tokens = sum(f.token_count for f in changed)
@@ -309,7 +352,8 @@ async def _run_index(repo_id: str, rid: uuid.UUID, repo_path: str,
         raise
 
     logger.info("code_qa.index_done", repo_id=repo_id, incr=only_paths is not None,
-                files=summary.files_indexed, chunks=summary.chunks_created)
+                files=summary.files_indexed, chunks=summary.chunks_created,
+                seconds=round(time.perf_counter() - started, 3))
     return summary
 
 
@@ -317,20 +361,20 @@ async def index_repo(repo_id: str) -> IndexSummary:
     """全量索引入口：镜像工作树（含已删除文件）；hash 未变的文件整文件跳过，重跑幂等。"""
     # psycopg3 原生适配 uuid 对象；text() 里写 :x::uuid 会与占位符解析冲突，故不在 SQL 里强转
     rid = uuid.UUID(repo_id)
-    repo_path, _ = await _claim_indexing(rid)
-    return await _run_index(repo_id, rid, repo_path, None)
+    repo_path, _, rebuild = await _claim_indexing(rid)
+    return await _run_index(repo_id, rid, repo_path, None, rebuild=rebuild)
 
 
 async def incremental_index(repo_id: str) -> IndexSummary:
     """增量索引入口：只重建 git diff 锚点..HEAD 变更的文件（文件级先删后插）。
     只认已提交的变更；锚点缺失（非 git 仓库/从未索引）或 git 失败自动降级全量。"""
     rid = uuid.UUID(repo_id)
-    repo_path, anchor = await _claim_indexing(rid)
+    repo_path, anchor, rebuild = await _claim_indexing(rid)
     only_paths: set[str] | None = None
-    if anchor:
+    if anchor and not rebuild:
         names = await asyncio.to_thread(_git_diff_names, repo_path, anchor)
         if names is None:
             logger.warning("code_qa.incr_fallback_full", repo_id=repo_id, anchor=anchor[:8])
         else:
             only_paths = set(names)
-    return await _run_index(repo_id, rid, repo_path, only_paths)
+    return await _run_index(repo_id, rid, repo_path, only_paths, rebuild=rebuild)

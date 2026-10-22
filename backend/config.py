@@ -4,6 +4,7 @@
 from functools import lru_cache  # 标准库装饰器：缓存函数结果，让函数体实际只执行一次
 
 from pydantic_settings import BaseSettings, SettingsConfigDict  # Pydantic 的「配置基类」：能自动从环境变量/.env 文件读取
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -42,6 +43,9 @@ class Settings(BaseSettings):
     reranker_model_path: str = "./models/reranker/bge-reranker-large"    # 精排模型
     classifier_model_path: str = "./models/classifier/all-MiniLM-L6-v2"  # 意图分类模型
     bge_m3_model_path: str = "./models/embedding/bge-m3"                 # 嵌入模型
+    embedding_cache_path: str = './.cache/embeddings.sqlite3'  # 留空可禁用持久缓存
+    embedding_cache_max_entries: int = Field(default=10000, ge=1, le=1000000)
+    embedding_batch_size: int = Field(default=16, ge=1, le=256)
 
     # ── JWT 认证 ──
     jwt_secret_key: str                          # 签发登录令牌用的密钥

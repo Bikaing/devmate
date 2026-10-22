@@ -1,7 +1,7 @@
 # backend/agents/code_review/graph.py
-# code_review LangGraph 图：diff -> rules -> context -> review -> summarize 五节点线性图。
-# diff 失败写 error 并经条件边直达 END（审查无从谈起）；其余节点各自降级不中断：
-# rules 纯函数无失败面，context 内部已降级，review 逐文件重试一次再降级为空列表，
+# code_review：diff -> rules -> context（种子窗口）-> analysis -> review -> summarize。
+# diff/analysis 失败写 error 并经条件边结束；context 可降级，
+# rules 是普通规则工具；review 逐文件重试一次后明确标记失败，
 # summarize 失败退化为统计话术。
 # review 节点 get_structured_llm + Semaphore 逐文件并发；进度/结果派发
 import asyncio
@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 from backend.agents.code_review import prompts
+from backend.agents.code_review.analysis.graph import analyze_change
 from backend.agents.code_review.context import build_contexts
 from backend.agents.code_review.diff_parser import collect_diff
 from backend.agents.code_review.rules import check_rules
@@ -57,17 +58,56 @@ async def context_node(state: ReviewState) -> dict:
     return {"contexts": contexts}
 
 
-async def _review_file(llm, f: dict, contexts: list[dict], basis: str) -> list[dict]:
-    """单文件审查：结构化调用，解析/调用失败重试一次，再失败降级为空列表。"""
+async def analysis_node(state: ReviewState) -> dict:
+    """独立分析 Agent 按需搜集代码证据，失败明确终止审查。"""
+    sem = asyncio.Semaphore(REVIEW_CONCURRENCY)
+    files = state.get('diff_files') or []
+    contexts = state.get('contexts') or {}
+
+    async def one(index, file):
+        async with sem:
+            try:
+                analysis = await analyze_change(state['repo_path'], state['mode'],
+                    state.get('head_ref', ''), file, contexts.get(file['path']) or [],
+                    state.get('review_basis', ''))
+                await adispatch_custom_event('review_progress', dict(stage='analysis',
+                    file=file['path'], done=index + 1, total=len(files),
+                    evidence_count=len(analysis['evidence']), status='success'))
+                return file['path'], analysis, None
+            except Exception as exc:
+                logger.exception('code_review.analysis_failed', path=file['path'])
+                await adispatch_custom_event('review_progress', dict(stage='analysis',
+                    file=file['path'], done=index + 1, total=len(files), status='failed'))
+                reason = getattr(exc, 'public_message', type(exc).__name__)
+                return file['path'], None, f"文件 {file['path']} 分析失败（{reason}），审查未完成"
+
+    results = await asyncio.gather(*(one(i, file) for i, file in enumerate(files)))
+    errors = [error for _, _, error in results if error]
+    return dict(analyses={path: result for path, result, _ in results if result},
+                error='\n'.join(errors) if errors else None)
+
+
+def _route_after_analysis(state: ReviewState) -> str:
+    return END if state.get('error') else 'review'
+
+
+async def _review_file(llm, f: dict, contexts: list[dict], basis: str, analysis: dict | None = None) -> list[dict]:
+    """单文件审查：调用、解析或结构校验失败重试一次，耗尽后上报失败。"""
     messages = [SystemMessage(content=prompts.SYSTEM_PROMPT),
-                HumanMessage(content=prompts.build_user_prompt(f, contexts, basis))]
+                HumanMessage(content=prompts.build_user_prompt(f, contexts, basis, analysis))]
     for attempt in (1, 2):
         try:
             out = await llm.ainvoke(messages)
+            if not isinstance(out, prompts.ReviewOutputModel):
+                raise ValueError("模型未返回有效的审查结构")
             return [{**fm.model_dump(), "source": "llm"} for fm in out.findings]
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             logger.exception("code_review.review_file_failed", path=f["path"], attempt=attempt)
-    return []
+    raise RuntimeError(
+        f"文件 {f['path']} 审查失败：模型调用或结果解析连续 2 次失败"
+        f"（{type(last_error).__name__}）；本次审查未完成，不能据此判断没有问题。"
+    ) from last_error
 
 
 def _merge_findings(rule: list[dict], llm: list[dict]) -> list[dict]:
@@ -93,18 +133,29 @@ async def review_node(state: ReviewState) -> dict:
     sem = asyncio.Semaphore(REVIEW_CONCURRENCY)
     total = len(diff_files)
 
-    async def one(idx: int, f: dict) -> list[dict]:
+    async def one(idx: int, f: dict) -> tuple[list[dict], str | None]:
         async with sem:
-            found = await _review_file(llm, f, contexts.get(f["path"]) or [], basis)
+            try:
+                analysis = (state.get('analyses') or {}).get(f['path'])
+                evidence = analysis['evidence'] if analysis else contexts.get(f['path']) or []
+                found = await _review_file(llm, f, evidence, basis, analysis)
+            except Exception as exc:
+                logger.exception("code_review.file_incomplete", path=f["path"])
+                await adispatch_custom_event("review_progress", {
+                    "stage": "review", "file": f["path"], "done": idx + 1,
+                    "total": total, "status": "failed"})
+                return [], str(exc)
         await adispatch_custom_event("review_progress", {
             "stage": "review", "file": f["path"], "done": idx + 1, "total": total})
         if found:
             await adispatch_custom_event("review_comment", {"file": f["path"], "findings": found})
-        return found
+        return found, None
 
     batches = await asyncio.gather(*(one(i, f) for i, f in enumerate(diff_files)))
-    llm_findings = [x for b in batches for x in b]
-    return {"findings": _merge_findings(state.get("rule_findings") or [], llm_findings)}
+    llm_findings = [x for found, _ in batches for x in found]
+    errors = [error for _, error in batches if error]
+    return {"findings": _merge_findings(state.get("rule_findings") or [], llm_findings),
+            "error": "\n".join(errors) if errors else None}
 
 
 async def summarize_node(state: ReviewState) -> dict:
@@ -113,8 +164,12 @@ async def summarize_node(state: ReviewState) -> dict:
         return {}
     findings = state.get("findings") or []
     stats = state.get("diff_stats") or {}
+    summary_stats = {**stats, 'summary_scope': 'critical'}
     if not stats.get("files") and not findings:
-        return {"summary": "本次变更为空，未发现问题。"}
+        return {"summary": "本次变更为空，未发现问题。", 'diff_stats': summary_stats}
+    if not any(f['severity'] == 'critical' for f in findings):
+        await adispatch_custom_event('review_progress', {'stage': 'summarize'})
+        return {'summary': prompts.critical_summary(findings), 'diff_stats': summary_stats}
     try:
         llm = get_structured_llm("summarize", prompts.SummaryModel)
         out = await llm.ainvoke([HumanMessage(
@@ -122,24 +177,25 @@ async def summarize_node(state: ReviewState) -> dict:
         summary = out.summary
     except Exception:
         logger.exception("code_review.summarize_failed")
-        summary = (f"审查完成：{stats.get('files', 0)} 个文件变更，"
-                   f"发现 {len(findings)} 个问题，详见问题列表。")
+        summary = prompts.critical_summary(findings)
     await adispatch_custom_event("review_progress", {"stage": "summarize"})
-    return {"summary": summary}
+    return {"summary": summary, 'diff_stats': summary_stats}
 
 
 def build_code_review_graph(checkpointer=None):
-    """编译五节点线性图；checkpointer 由调用方注入（lifespan 用 PG 版，单测用 MemorySaver）。"""
+    """分析先于审查；checkpointer 保存分析报告和证据。"""
     graph = StateGraph(ReviewState)
     graph.add_node("diff", diff_node)
     graph.add_node("rules", rules_node)
     graph.add_node("context", context_node)
+    graph.add_node("analysis", analysis_node)
     graph.add_node("review", review_node)
     graph.add_node("summarize", summarize_node)
     graph.set_entry_point("diff")
     graph.add_conditional_edges("diff", _route_after_diff)
     graph.add_edge("rules", "context")
-    graph.add_edge("context", "review")
+    graph.add_edge("context", "analysis")
+    graph.add_conditional_edges('analysis', _route_after_analysis)
     graph.add_edge("review", "summarize")
     graph.add_edge("summarize", END)
     return graph.compile(checkpointer=checkpointer)

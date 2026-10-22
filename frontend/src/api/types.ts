@@ -108,6 +108,14 @@ export interface ReviewTask {
 
 // 详情比列表多 review_basis 与全量 findings
 export interface ReviewTaskDetail extends ReviewTask {
+  analyses?: Record<string, {
+    changed_behavior: string;
+    dependencies: { relationship: string; evidence_ids: string[] }[];
+    review_focus: string[];
+    unknowns: string[];
+    limitations: string[];
+    evidence: { id: string; path: string; start_line: number; end_line: number; content: string }[];
+  }>;
   review_basis: string | null;
   findings: ReviewFinding[];
 }

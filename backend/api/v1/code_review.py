@@ -98,7 +98,7 @@ async def get_task(
 ):
     """任务详情 + 全量 findings（severity 严重度倒序），供页面刷新后回看与 HitL 操作。"""
     task = (await db.execute(text(
-        "SELECT id, repo_id, mode, base_ref, head_ref, review_basis, status, summary, "
+        "SELECT id, repo_id, mode, base_ref, head_ref, review_basis, status, summary, analyses, "
         "diff_stats, error_message, duration_ms, created_at "
         "FROM review_tasks WHERE id = :tid AND user_id = :uid"),
         {"tid": task_id, "uid": current_user["user_id"]})).first()
@@ -111,11 +111,19 @@ async def get_task(
         "ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, "
         "start_line"),
         {"tid": task_id})).all()
+    summary = task.summary
+    if summary:
+        summary = summary.replace('摘要仅覆盖 critical，不代表没有其他级别的问题。', '').strip()
+    if task.status == 'success' and (task.diff_stats or {}).get('summary_scope') != 'critical':
+        # Old stored summaries may contain warning/info details; do not expose those as critical risks.
+        from backend.agents.code_review.prompts import critical_summary
+        summary = critical_summary([dict(r._mapping) for r in rows])
     return {
         "id": str(task.id), "repo_id": str(task.repo_id), "mode": task.mode,
         "base_ref": task.base_ref, "head_ref": task.head_ref,
         "review_basis": task.review_basis, "status": task.status,
-        "summary": task.summary, "diff_stats": task.diff_stats,
+        "analyses": task.analyses,
+        "summary": summary, "diff_stats": task.diff_stats,
         "error_message": task.error_message, "duration_ms": task.duration_ms,
         "created_at": task.created_at.isoformat(),
         "findings": [{"id": str(r.id), "file": r.file, "start_line": r.start_line,
